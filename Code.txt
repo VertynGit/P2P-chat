@@ -1,0 +1,195 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/epoll.h>
+#include <errno.h>
+#include <error.h>
+
+typedef struct log{
+    int fd;
+    char ip[16];
+    struct log* next;
+}log;
+int log_add(log** head, int client_fd, char* client_ip) {
+    log* tmp = (log*)malloc(sizeof(log));
+    if (tmp == NULL)return 1;
+    strcpy(tmp->ip, client_ip);
+    tmp->fd = client_fd;
+    log* p = *head;
+    *head = tmp;
+    tmp->next = p;
+    return 0;
+}
+int log_dell(log** head, int client_fd) {
+    log* temp = *head;
+    for (log* i = temp; i != 0; i = i->next) {
+        if (i->fd == client_fd) {
+            if (i == *head) *head = i->next;
+            else temp->next = i->next;
+            free(i);
+            return 0;
+        }
+        log* temp = i;
+    }
+    return 1;
+}
+int log_find(log* head, char* client_ip) {
+    for (log* i = head; i != 0; i = i->next)
+        if (strcmp(i->ip,client_ip) == 0) return i->fd;
+    return 0;
+}
+void* log_free(log** head) {
+    log* temp = *head;
+    while (temp != 0) {
+        log* t = temp;
+        temp = temp->next;
+        free(t);
+    }
+}
+void* log_view(log* head) {
+    for (log* i = head; i != 0; i = i->next)
+    {
+        printf("client(fd: %d, ip: %s)\n", i->fd, i->ip);
+    }
+}
+
+int ADD_Client(int fd, int pollfd, struct sockaddr_in *client_address, struct epoll_event *ev, log **head) {
+    char* temp = inet_ntoa(client_address->sin_addr);
+    printf("Connect to client (fd: %d, ip: %s)\n", fd, temp);
+    ev->data.fd = fd;
+    if (epoll_ctl(pollfd, EPOLL_CTL_ADD, fd, ev)) {
+        error(0, errno, "epoll_ctr(ADD)");
+        return 1;
+    }
+    if (log_add(head, fd, temp))return 1;
+    log_view(*head);
+    return 0;
+
+}
+
+int main(int argc, char *argv[]) {
+    log* head_log = NULL;
+    if(argc!=4){
+    printf("Введены не все параметры!\n");
+    exit(1);
+    }
+    printf("P2P Client is starting\n");
+	printf("Привет %s\n", argv[1]);
+    int name_len = strlen(argv[1]);
+    char buff[1024];
+    char message[1050];
+    
+    strcpy(message, argv[1]);
+    strcpy(message + name_len, ": ");
+    name_len += 2;
+    int pollfd;
+    struct epoll_event ev = {
+        .events = EPOLLIN, 
+    };
+
+	int port = atoi(argv[3]);
+    int client_socket;
+	int local_socket;
+	local_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (local_socket == -1) {
+        printf("error socket()\n");
+        exit(1);
+    };
+	struct  sockaddr_in local_address;
+    struct  sockaddr_in client_address;
+
+    local_address.sin_family = AF_INET;           
+    local_address.sin_port = htons(port);
+ 
+    inet_aton(argv[2], &local_address.sin_addr);
+  //////
+/////
+     if (bind(local_socket, (struct sockaddr*)&local_address, sizeof(local_address))) {
+        error(0, errno, "bind()");
+        close(local_socket);
+        exit(1);
+    }
+    if (listen(local_socket, 5)) {
+        error(0, errno, "listen()");
+        close(local_socket);
+        exit(1);
+    }
+    pollfd = epoll_create1(0);  //файловый дескриптор для epoll
+    if (pollfd == -1) {
+        error(0, errno, "epoll_create1()");
+        close(local_socket);
+        exit(1);
+    }
+    ev.data.fd = local_socket;
+    if (epoll_ctl(pollfd, EPOLL_CTL_ADD, local_socket, &ev)) {  
+        error(0, errno, "epoll_ctr(ADD)");
+        close(pollfd);
+        close(local_socket);
+        exit(1);
+    }
+	ev.data.fd=0;
+    if (epoll_ctl(pollfd, EPOLL_CTL_ADD, 0, &ev)) { error(0, errno, "epoll_ctr(ADD)"); goto Error; }
+
+
+
+    while (1) {
+        int count = epoll_wait(pollfd, &ev, 1, 1000);  // ждём событие в течении 1000 мс
+        if (count == -1) {  // если ошибка
+            error(0, errno, "epoll_wait()");
+            goto Error;
+        } else if (count == 0) continue;
+ 
+    int fd = ev.data.fd;
+    char* temp;
+
+    if (fd == 0) { //Ввод пользователя
+        count = read(0, buff, 16);
+        buff[count-1] = '\0';
+        if (strcmp(buff, "exit") == 0)break;
+        if ((client_socket = log_find(head_log, buff)) == 0) {
+            client_socket = socket(AF_INET, SOCK_STREAM, 0);
+            client_address.sin_family = AF_INET;
+            client_address.sin_port = htons(9002);
+            inet_aton(buff, &client_address.sin_addr);
+            int connection_status = connect(client_socket, (struct sockaddr*)&client_address, sizeof(client_address));
+            if (connection_status == -1) {
+                printf("There was an error making a connection to the remote socket \n");
+                continue;
+            }
+            if (ADD_Client(client_socket, pollfd, &client_address, &ev, &head_log)) { close(client_socket); printf("Connection error (fd: %d)\n", client_socket); continue; }
+        }
+        printf("Input:\n");
+	    while  ((count = read(0, message+name_len, 1024)) > 1) {
+	        write(client_socket, message, name_len+count);
+        }
+    }
+    else if (fd == local_socket) {//новое подключение
+        int client_address_len = sizeof(client_address);
+        fd = accept(local_socket, (struct sockaddr *)&client_address, &client_address_len);
+        if (ADD_Client(fd, pollfd, &client_address, &ev, &head_log)) { close(fd); printf("Connection error (fd: %d)\n", fd); continue; }
+        } else {  // клиент
+            int bytes = recv(fd, &buff, sizeof(buff), 0);
+            if (bytes == -1) { //ошибка
+                error(0, errno, "recv1()");
+            } else if (bytes == 0) {  // отключился 
+              	error(0, errno, "epoll_ctr(DEL)");
+		        close(fd);
+                log_dell(&head_log, fd);
+            	printf("Disconnected client (fd: %d)\n", fd);
+		        }
+            write(1, buff, bytes);
+        }
+ 
+    }
+    log_free(&head_log);
+    close(pollfd);
+	return 0;
+Error: log_free(&head_log);
+    close(pollfd);
+    return 1;
+}
